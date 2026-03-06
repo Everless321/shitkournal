@@ -1,5 +1,5 @@
 const SUPABASE_URL = "https://bcgdqepzakcufaadgnda.supabase.co";
-const API_KEY = "sb_publishable_wHqWLjQwO2lMwkGLeBktng_Mk_xf5xd";
+const SITE_URL = "https://shitjournal.org";
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
 const CORS = {
@@ -7,7 +7,52 @@ const CORS = {
   "Access-Control-Allow-Methods": "GET, OPTIONS",
 };
 
-const META_TTL = 86400; // 24h
+const META_TTL = 86400;     // 24h
+const KEY_TTL = 86400;      // 24h
+
+// ── API Key 自动提取 ────────────────────────────────
+async function resolveApiKey() {
+  const cache = caches.default;
+  const cacheKey = new Request("https://cache.internal/supabase-api-key");
+
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached.text();
+
+  // 1. 拉首页 HTML，提取 JS bundle URL
+  const htmlRes = await fetch(SITE_URL, {
+    headers: { "User-Agent": "Mozilla/5.0" },
+  });
+  if (!htmlRes.ok) return null;
+  const html = await htmlRes.text();
+
+  const scriptMatch = html.match(/src="(\/assets\/index-[^"]+\.js)"/);
+  if (!scriptMatch) return null;
+
+  // 2. 拉 JS bundle，提取 key
+  const jsRes = await fetch(`${SITE_URL}${scriptMatch[1]}`, {
+    headers: { "User-Agent": "Mozilla/5.0" },
+  });
+  if (!jsRes.ok) return null;
+  const js = await jsRes.text();
+
+  // 模式: "https://bcgdqepzakcufaadgnda.supabase.co",XX="<key>"
+  const keyMatch = js.match(
+    /bcgdqepzakcufaadgnda\.supabase\.co",[A-Za-z0-9_$]+="([^"]+)"/
+  );
+  if (!keyMatch) return null;
+
+  const apiKey = keyMatch[1];
+
+  // 3. 缓存 24h
+  await cache.put(
+    cacheKey,
+    new Response(apiKey, {
+      headers: { "Cache-Control": `public, max-age=${KEY_TTL}` },
+    })
+  );
+
+  return apiKey;
+}
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -21,24 +66,24 @@ function extractId(input) {
   return m ? m[0] : null;
 }
 
-async function fetchMeta(id) {
+async function fetchMeta(id, apiKey) {
   const url =
     `${SUPABASE_URL}/rest/v1/preprints_with_ratings_mat` +
     `?select=id,pdf_path,manuscript_title,author_name,institution,discipline,created_at,viscosity` +
     `&id=eq.${id}`;
   const res = await fetch(url, {
-    headers: { apikey: API_KEY, "Content-Type": "application/json" },
+    headers: { apikey: apiKey, "Content-Type": "application/json" },
   });
   if (!res.ok) return null;
   const rows = await res.json();
   return rows.length ? rows[0] : null;
 }
 
-async function fetchSignedUrl(pdfPath) {
+async function fetchSignedUrl(pdfPath, apiKey) {
   const url = `${SUPABASE_URL}/storage/v1/object/sign/manuscripts/${pdfPath}`;
   const res = await fetch(url, {
     method: "POST",
-    headers: { apikey: API_KEY, "Content-Type": "application/json" },
+    headers: { apikey: apiKey, "Content-Type": "application/json" },
     body: JSON.stringify({ expiresIn: 3600 }),
   });
   if (!res.ok) return null;
@@ -47,7 +92,7 @@ async function fetchSignedUrl(pdfPath) {
 }
 
 // ── /api/info ────────────────────────────────────────
-async function handleInfo(id) {
+async function handleInfo(id, apiKey) {
   const cache = caches.default;
   const cacheKey = new Request(`https://cache.internal/meta/${id}`);
 
@@ -57,7 +102,7 @@ async function handleInfo(id) {
     return json({ ...body, _cache: "HIT" });
   }
 
-  const row = await fetchMeta(id);
+  const row = await fetchMeta(id, apiKey);
   if (!row) return json({ error: "Preprint not found" }, 404);
   if (!row.pdf_path) return json({ error: "No PDF available" }, 404);
 
@@ -85,11 +130,9 @@ async function handleInfo(id) {
 }
 
 // ── /api/download ────────────────────────────────────
-// R2 持久存储：首次从 Supabase 拉取并写入 R2，后续直接从 R2 返回
-async function handleDownload(id, bucket) {
+async function handleDownload(id, bucket, apiKey) {
   const r2Key = `pdfs/${id}.pdf`;
 
-  // 1. 查 R2
   const r2Obj = await bucket.get(r2Key);
   if (r2Obj) {
     const meta = JSON.parse(r2Obj.customMetadata?.meta || "{}");
@@ -105,11 +148,10 @@ async function handleDownload(id, bucket) {
     });
   }
 
-  // 2. R2 未命中 → 回源 Supabase
-  const row = await fetchMeta(id);
+  const row = await fetchMeta(id, apiKey);
   if (!row || !row.pdf_path) return json({ error: "PDF not found" }, 404);
 
-  const signedUrl = await fetchSignedUrl(row.pdf_path);
+  const signedUrl = await fetchSignedUrl(row.pdf_path, apiKey);
   if (!signedUrl) return json({ error: "Failed to get signed URL" }, 502);
 
   const pdfRes = await fetch(signedUrl);
@@ -119,7 +161,6 @@ async function handleDownload(id, bucket) {
   const safeName = title ? `${title}.pdf` : row.pdf_path.split("/").pop();
   const pdfBody = await pdfRes.arrayBuffer();
 
-  // 3. 写入 R2（后台执行，不阻塞响应）
   const putPromise = bucket.put(r2Key, pdfBody, {
     httpMetadata: { contentType: "application/pdf" },
     customMetadata: {
@@ -133,7 +174,6 @@ async function handleDownload(id, bucket) {
     },
   });
 
-  // 4. 并行返回响应 + 写 R2
   const response = new Response(pdfBody, {
     headers: {
       "Content-Type": "application/pdf",
@@ -144,7 +184,6 @@ async function handleDownload(id, bucket) {
     },
   });
 
-  // waitUntil 让 R2 写入在响应返回后继续执行
   return { response, putPromise };
 }
 
@@ -157,24 +196,28 @@ export default {
       return new Response(null, { headers: CORS });
     }
 
-    if (url.pathname === "/api/info") {
-      const id = extractId(url.searchParams.get("id"));
-      if (!id) return json({ error: "Invalid preprint ID" }, 400);
-      return handleInfo(id);
-    }
+    if (url.pathname.startsWith("/api/")) {
+      const apiKey = await resolveApiKey();
+      if (!apiKey) return json({ error: "Failed to resolve API key" }, 503);
 
-    if (url.pathname === "/api/download") {
-      const id = extractId(url.searchParams.get("id"));
-      if (!id) return json({ error: "Invalid preprint ID" }, 400);
-      const result = await handleDownload(id, env.PDF_BUCKET);
-      if (result.putPromise) {
-        ctx.waitUntil(result.putPromise);
-        return result.response;
+      if (url.pathname === "/api/info") {
+        const id = extractId(url.searchParams.get("id"));
+        if (!id) return json({ error: "Invalid preprint ID" }, 400);
+        return handleInfo(id, apiKey);
       }
-      return result;
+
+      if (url.pathname === "/api/download") {
+        const id = extractId(url.searchParams.get("id"));
+        if (!id) return json({ error: "Invalid preprint ID" }, 400);
+        const result = await handleDownload(id, env.PDF_BUCKET, apiKey);
+        if (result.putPromise) {
+          ctx.waitUntil(result.putPromise);
+          return result.response;
+        }
+        return result;
+      }
     }
 
-    // 非 API 路由交给 Assets 处理（静态文件）
     return env.ASSETS.fetch(request);
   },
 };
