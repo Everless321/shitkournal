@@ -174,6 +174,7 @@ export default {
       return result;
     }
 
-    return new Response(null, { status: 404 });
+    // 非 API 路由交给 Assets 处理（静态文件）
+    return env.ASSETS.fetch(request);
   },
 };
