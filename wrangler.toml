@@ -1,0 +1,10 @@
+name = "shitkournal"
+main = "src/worker.js"
+compatibility_date = "2024-12-01"
+
+[assets]
+directory = "./public"
+
+[[r2_buckets]]
+binding = "PDF_BUCKET"
+bucket_name = "shitkournal-pdfs"

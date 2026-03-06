@@ -268,7 +268,7 @@
 <div class="container">
   <div class="header">
     <h1>S.H.I.T JOURNAL</h1>
-    <p>PDF Fetcher &mdash; Supabase Storage &gt; Signed URL &gt; Download</p>
+    <p>PDF Fetcher &mdash; Cloudflare R2 &gt; Edge Cache &gt; Download</p>
   </div>
 
   <div class="input-group">
@@ -292,7 +292,7 @@
   <div class="download-card" id="card"></div>
 
   <div class="footer">
-    Supabase Storage API &middot; Zero dependencies &middot; <a href="https://shitjournal.org" target="_blank">shitjournal.org</a>
+    Cloudflare Workers + R2 &middot; Edge cached &middot; <a href="https://shitjournal.org" target="_blank">shitjournal.org</a>
   </div>
 </div>
 
@@ -400,18 +400,22 @@ async function start() {
   }
 
   ok('Record found');
+  if (data._cache === 'HIT') ok('Served from edge cache');
   detail('title', data.title || '?', 'val-highlight');
   detail('author', data.author || '?');
   detail('institution', data.institution || '?');
   detail('discipline', data.discipline || '?');
   detail('created', data.created_at || '?');
+  setProgress(70);
 
-  // Step 3: Signed URL
-  step('Signed URL');
+  // Step 3: Ready
+  step('Storage');
   detail('pdf_path', data.pdf_path, 'val-cyan');
   detail('filename', data.filename);
-  ok('Download URL ready');
-  setProgress(80);
+  detail('cache', data._cache === 'HIT' ? 'Cloudflare Edge (24h)' : 'Supabase origin');
+  detail('pdf_store', 'R2 persistent bucket');
+  ok('Download ready');
+  setProgress(90);
 
   // Step 4: Done
   const total = (performance.now() - t0).toFixed(0);
