@@ -410,9 +410,9 @@ async function start() {
 
   // Step 3: Ready
   step('Storage');
-  detail('pdf_path', data.pdf_path, 'val-cyan');
+  detail('pdf_url', data.pdf_url || data.pdf_path, 'val-cyan');
   detail('filename', data.filename);
-  detail('cache', data._cache === 'HIT' ? 'Cloudflare Edge (24h)' : 'Supabase origin');
+  detail('cache', data._cache === 'HIT' ? 'Cloudflare Edge (24h)' : 'Origin');
   detail('pdf_store', 'R2 persistent bucket');
   ok('Download ready');
   setProgress(90);

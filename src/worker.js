@@ -1,58 +1,14 @@
-const SUPABASE_URL = "https://bcgdqepzakcufaadgnda.supabase.co";
-const SITE_URL = "https://shitjournal.org";
+const API_BASE = "https://api.shitjournal.org/api";
+const FILES_BASE = "https://files.shitjournal.org";
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+const ZONES = ["latrine", "septic", "stone", "sediment"];
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, OPTIONS",
 };
 
-const META_TTL = 86400;     // 24h
-const KEY_TTL = 86400;      // 24h
-
-// ── API Key 自动提取 ────────────────────────────────
-async function resolveApiKey() {
-  const cache = caches.default;
-  const cacheKey = new Request("https://cache.internal/supabase-api-key");
-
-  const cached = await cache.match(cacheKey);
-  if (cached) return cached.text();
-
-  // 1. 拉首页 HTML，提取 JS bundle URL
-  const htmlRes = await fetch(SITE_URL, {
-    headers: { "User-Agent": "Mozilla/5.0" },
-  });
-  if (!htmlRes.ok) return null;
-  const html = await htmlRes.text();
-
-  const scriptMatch = html.match(/src="(\/assets\/index-[^"]+\.js)"/);
-  if (!scriptMatch) return null;
-
-  // 2. 拉 JS bundle，提取 key
-  const jsRes = await fetch(`${SITE_URL}${scriptMatch[1]}`, {
-    headers: { "User-Agent": "Mozilla/5.0" },
-  });
-  if (!jsRes.ok) return null;
-  const js = await jsRes.text();
-
-  // 模式: "https://bcgdqepzakcufaadgnda.supabase.co",XX="<key>"
-  const keyMatch = js.match(
-    /bcgdqepzakcufaadgnda\.supabase\.co",[A-Za-z0-9_$]+="([^"]+)"/
-  );
-  if (!keyMatch) return null;
-
-  const apiKey = keyMatch[1];
-
-  // 3. 缓存 24h
-  await cache.put(
-    cacheKey,
-    new Response(apiKey, {
-      headers: { "Cache-Control": `public, max-age=${KEY_TTL}` },
-    })
-  );
-
-  return apiKey;
-}
+const META_TTL = 86400; // 24h
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -66,33 +22,8 @@ function extractId(input) {
   return m ? m[0] : null;
 }
 
-async function fetchMeta(id, apiKey) {
-  const url =
-    `${SUPABASE_URL}/rest/v1/preprints_with_ratings_mat` +
-    `?select=id,pdf_path,manuscript_title,author_name,institution,discipline,created_at,viscosity` +
-    `&id=eq.${id}`;
-  const res = await fetch(url, {
-    headers: { apikey: apiKey, "Content-Type": "application/json" },
-  });
-  if (!res.ok) return null;
-  const rows = await res.json();
-  return rows.length ? rows[0] : null;
-}
-
-async function fetchSignedUrl(pdfPath, apiKey) {
-  const url = `${SUPABASE_URL}/storage/v1/object/sign/manuscripts/${pdfPath}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { apikey: apiKey, "Content-Type": "application/json" },
-    body: JSON.stringify({ expiresIn: 3600 }),
-  });
-  if (!res.ok) return null;
-  const { signedURL } = await res.json();
-  return signedURL ? `${SUPABASE_URL}/storage/v1${signedURL}` : null;
-}
-
 // ── /api/info ────────────────────────────────────────
-async function handleInfo(id, apiKey) {
+async function handleInfo(id) {
   const cache = caches.default;
   const cacheKey = new Request(`https://cache.internal/meta/${id}`);
 
@@ -102,20 +33,22 @@ async function handleInfo(id, apiKey) {
     return json({ ...body, _cache: "HIT" });
   }
 
-  const row = await fetchMeta(id, apiKey);
-  if (!row) return json({ error: "Preprint not found" }, 404);
-  if (!row.pdf_path) return json({ error: "No PDF available" }, 404);
+  const res = await fetch(`${API_BASE}/articles/${id}`);
+  if (!res.ok) return json({ error: "Article not found" }, 404);
+
+  const { article } = await res.json();
+  if (!article) return json({ error: "Article not found" }, 404);
 
   const body = {
-    id: row.id,
-    title: row.manuscript_title,
-    author: row.author_name,
-    institution: row.institution,
-    discipline: row.discipline,
-    viscosity: row.viscosity,
-    created_at: row.created_at,
-    pdf_path: row.pdf_path,
-    filename: row.pdf_path.split("/").pop(),
+    id: article.id,
+    title: article.title,
+    author: article.author?.display_name,
+    institution: article.author?.institution,
+    discipline: article.discipline,
+    zone: article.zones,
+    created_at: article.created_at,
+    pdf_url: article.pdf_url,
+    filename: `${article.id}.pdf`,
   };
 
   const toCache = new Response(JSON.stringify(body), {
@@ -130,7 +63,7 @@ async function handleInfo(id, apiKey) {
 }
 
 // ── /api/download ────────────────────────────────────
-async function handleDownload(id, bucket, apiKey) {
+async function handleDownload(id, bucket) {
   const r2Key = `pdfs/${id}.pdf`;
 
   const r2Obj = await bucket.get(r2Key);
@@ -148,30 +81,27 @@ async function handleDownload(id, bucket, apiKey) {
     });
   }
 
-  const row = await fetchMeta(id, apiKey);
-  if (!row || !row.pdf_path) return json({ error: "PDF not found" }, 404);
+  const pdfUrl = `${FILES_BASE}/${id}.pdf`;
+  const pdfRes = await fetch(pdfUrl);
+  if (!pdfRes.ok) return json({ error: "PDF not found" }, 404);
 
-  const signedUrl = await fetchSignedUrl(row.pdf_path, apiKey);
-  if (!signedUrl) return json({ error: "Failed to get signed URL" }, 502);
+  let safeName = `${id}.pdf`;
+  try {
+    const metaRes = await fetch(`${API_BASE}/articles/${id}`);
+    if (metaRes.ok) {
+      const { article } = await metaRes.json();
+      if (article?.title) {
+        const title = article.title.replace(/[^\w\u4e00-\u9fff\s-]/g, "").slice(0, 80);
+        safeName = `${title}.pdf`;
+      }
+    }
+  } catch {}
 
-  const pdfRes = await fetch(signedUrl);
-  if (!pdfRes.ok) return json({ error: "Failed to download PDF" }, 502);
-
-  const title = (row.manuscript_title || "").replace(/[^\w\u4e00-\u9fff\s-]/g, "").slice(0, 80);
-  const safeName = title ? `${title}.pdf` : row.pdf_path.split("/").pop();
   const pdfBody = await pdfRes.arrayBuffer();
 
   const putPromise = bucket.put(r2Key, pdfBody, {
     httpMetadata: { contentType: "application/pdf" },
-    customMetadata: {
-      meta: JSON.stringify({
-        safeName,
-        title: row.manuscript_title,
-        author: row.author_name,
-        id: row.id,
-        storedAt: new Date().toISOString(),
-      }),
-    },
+    customMetadata: { meta: JSON.stringify({ safeName, id, storedAt: new Date().toISOString() }) },
   });
 
   const response = new Response(pdfBody, {
@@ -187,6 +117,66 @@ async function handleDownload(id, bucket, apiKey) {
   return { response, putPromise };
 }
 
+// ── /api/list ────────────────────────────────────────
+async function handleList() {
+  const all = [];
+
+  for (const zone of ZONES) {
+    let page = 1;
+    while (true) {
+      const res = await fetch(`${API_BASE}/articles/?zone=${zone}&page=${page}`);
+      if (!res.ok) break;
+      const data = await res.json();
+      if (!data.data?.length) break;
+
+      for (const a of data.data) {
+        if (a.pdf_url) {
+          all.push({ id: a.id, title: a.title, author: a.author?.display_name, pdf_url: a.pdf_url });
+        }
+      }
+
+      if (page >= data.total_pages) break;
+      page++;
+    }
+  }
+
+  return json({ total: all.length, preprints: all });
+}
+
+// ── /api/warm ────────────────────────────────────────
+async function handleWarm(id, bucket) {
+  const r2Key = `pdfs/${id}.pdf`;
+
+  const head = await bucket.head(r2Key);
+  if (head) return json({ id, status: "exists", size: head.size });
+
+  const pdfUrl = `${FILES_BASE}/${id}.pdf`;
+  const pdfRes = await fetch(pdfUrl);
+  if (!pdfRes.ok) return json({ id, status: "download_failed" }, 502);
+
+  // 获取标题用于文件名（可选，失败不影响缓存）
+  let safeName = `${id}.pdf`;
+  try {
+    const metaRes = await fetch(`${API_BASE}/articles/${id}`);
+    if (metaRes.ok) {
+      const { article } = await metaRes.json();
+      if (article?.title) {
+        const title = article.title.replace(/[^\w\u4e00-\u9fff\s-]/g, "").slice(0, 80);
+        safeName = `${title}.pdf`;
+      }
+    }
+  } catch {}
+
+  const pdfBody = await pdfRes.arrayBuffer();
+
+  await bucket.put(r2Key, pdfBody, {
+    httpMetadata: { contentType: "application/pdf" },
+    customMetadata: { meta: JSON.stringify({ safeName, id, storedAt: new Date().toISOString() }) },
+  });
+
+  return json({ id, status: "cached", size: pdfBody.byteLength });
+}
+
 // ── Router ───────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
@@ -197,19 +187,26 @@ export default {
     }
 
     if (url.pathname.startsWith("/api/")) {
-      const apiKey = await resolveApiKey();
-      if (!apiKey) return json({ error: "Failed to resolve API key" }, 503);
-
       if (url.pathname === "/api/info") {
         const id = extractId(url.searchParams.get("id"));
         if (!id) return json({ error: "Invalid preprint ID" }, 400);
-        return handleInfo(id, apiKey);
+        return handleInfo(id);
+      }
+
+      if (url.pathname === "/api/list") {
+        return handleList();
+      }
+
+      if (url.pathname === "/api/warm") {
+        const id = extractId(url.searchParams.get("id"));
+        if (!id) return json({ error: "Invalid preprint ID" }, 400);
+        return handleWarm(id, env.PDF_BUCKET);
       }
 
       if (url.pathname === "/api/download") {
         const id = extractId(url.searchParams.get("id"));
         if (!id) return json({ error: "Invalid preprint ID" }, 400);
-        const result = await handleDownload(id, env.PDF_BUCKET, apiKey);
+        const result = await handleDownload(id, env.PDF_BUCKET);
         if (result.putPromise) {
           ctx.waitUntil(result.putPromise);
           return result.response;
